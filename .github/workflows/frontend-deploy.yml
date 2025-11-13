@@ -1,0 +1,136 @@
+name: Frontend - Build and Deploy
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'frontend/**'
+      - '.github/workflows/frontend-deploy.yml'
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: frontend
+  EKS_CLUSTER_NAME: my-eks-cluster
+  HELM_CHART_REPO: https://github.com/YOUR-ORG/eks-platform-infrastructure.git
+  HELM_CHART_PATH: helm-charts/frontend
+
+jobs:
+  build-and-deploy:
+    name: Build and Deploy Frontend
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout application code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build, tag, and push image to Amazon ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          cd frontend
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+
+      - name: Install Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: 'v3.13.0'
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
+
+      - name: Checkout Helm charts
+        uses: actions/checkout@v4
+        with:
+          repository: YOUR-ORG/eks-platform-infrastructure
+          path: helm-repo
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Deploy to EKS using Helm
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          helm upgrade --install frontend ./helm-repo/helm-charts/frontend \
+            --set image.repository=$ECR_REGISTRY/$ECR_REPOSITORY \
+            --set image.tag=$IMAGE_TAG \
+            --namespace default \
+            --wait \
+            --timeout 5m
+
+      - name: Verify deployment
+        run: |
+          kubectl rollout status deployment/frontend -n default
+          kubectl get pods -n default -l app.kubernetes.io/name=frontend
+          kubectl get svc frontend -n default
+          kubectl get ingress frontend -n default
+
+      - name: Get ALB URL
+        id: get-url
+        run: |
+          echo "Waiting for ALB to be provisioned..."
+          sleep 30
+          
+          ALB_URL=$(kubectl get ingress frontend -n default -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          
+          if [ -z "$ALB_URL" ]; then
+            echo "ALB URL not yet available, check ingress status:"
+            kubectl describe ingress frontend -n default
+          else
+            echo "alb_url=$ALB_URL" >> $GITHUB_OUTPUT
+            echo "✅ Frontend accessible at: http://$ALB_URL"
+          fi
+
+      - name: Run smoke tests
+        if: steps.get-url.outputs.alb_url != ''
+        run: |
+          ALB_URL="${{ steps.get-url.outputs.alb_url }}"
+          
+          # Wait for ALB to be fully ready
+          echo "Waiting for ALB to be ready..."
+          sleep 60
+          
+          # Test health endpoint
+          curl -f http://$ALB_URL/health || exit 1
+          echo "✓ Health check passed"
+          
+          # Test main page
+          curl -f http://$ALB_URL/ || exit 1
+          echo "✓ Main page accessible"
+
+      - name: Notify deployment success
+        if: success()
+        run: |
+          echo "✅ Frontend deployed successfully!"
+          echo "Image: ${{ steps.build-image.outputs.image }}"
+          echo "Cluster: ${{ env.EKS_CLUSTER_NAME }}"
+          if [ -n "${{ steps.get-url.outputs.alb_url }}" ]; then
+            echo "URL: http://${{ steps.get-url.outputs.alb_url }}"
+          fi

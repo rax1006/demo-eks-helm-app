@@ -1,0 +1,122 @@
+name: Backend - Build and Deploy
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'backend/**'
+      - '.github/workflows/backend-deploy.yml'
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: backend
+  EKS_CLUSTER_NAME: my-eks-cluster
+  HELM_CHART_REPO: https://github.com/YOUR-ORG/eks-platform-infrastructure.git
+  HELM_CHART_PATH: helm-charts/backend
+
+jobs:
+  build-and-deploy:
+    name: Build and Deploy Backend
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout application code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build, tag, and push image to Amazon ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          cd backend
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+
+      - name: Install Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: 'v3.13.0'
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
+
+      - name: Checkout Helm charts
+        uses: actions/checkout@v4
+        with:
+          repository: YOUR-ORG/eks-platform-infrastructure
+          path: helm-repo
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Deploy to EKS using Helm
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          helm upgrade --install backend ./helm-repo/helm-charts/backend \
+            --set image.repository=$ECR_REGISTRY/$ECR_REPOSITORY \
+            --set image.tag=$IMAGE_TAG \
+            --namespace default \
+            --wait \
+            --timeout 5m
+
+      - name: Verify deployment
+        run: |
+          kubectl rollout status deployment/backend -n default
+          kubectl get pods -n default -l app.kubernetes.io/name=backend
+          kubectl get svc backend -n default
+
+      - name: Run smoke tests
+        run: |
+          # Wait for service to be ready
+          sleep 10
+          
+          # Get service endpoint
+          BACKEND_URL=$(kubectl get svc backend -n default -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          
+          if [ -z "$BACKEND_URL" ]; then
+            echo "Using ClusterIP for testing"
+            kubectl port-forward svc/backend 8080:8080 -n default &
+            sleep 5
+            BACKEND_URL="localhost:8080"
+          fi
+          
+          # Test health endpoint
+          curl -f http://$BACKEND_URL/health || exit 1
+          echo "✓ Health check passed"
+          
+          # Test API endpoint
+          curl -f http://$BACKEND_URL/api/status || exit 1
+          echo "✓ API status check passed"
+
+      - name: Notify deployment success
+        if: success()
+        run: |
+          echo "✅ Backend deployed successfully!"
+          echo "Image: ${{ steps.build-image.outputs.image }}"
+          echo "Cluster: ${{ env.EKS_CLUSTER_NAME }}"
