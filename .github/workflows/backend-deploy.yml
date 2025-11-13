@@ -13,8 +13,6 @@ env:
   AWS_REGION: us-east-1
   ECR_REPOSITORY: backend
   EKS_CLUSTER_NAME: my-eks-cluster
-  HELM_CHART_REPO: https://github.com/rax1006/demo-eks-infra.git
-  HELM_CHART_PATH: helm-charts/backend
 
 jobs:
   build-and-deploy:
@@ -66,19 +64,12 @@ jobs:
         run: |
           aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
 
-      - name: Checkout Helm charts
-        uses: actions/checkout@v4
-        with:
-          repository: rax1006/demo-eks-infra
-          path: helm-repo
-          token: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Deploy to EKS using Helm
         env:
           IMAGE_TAG: ${{ github.sha }}
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         run: |
-          helm upgrade --install backend ./helm-repo/helm-charts/backend \
+          helm upgrade --install backend ./helm-charts/backend \
             --set image.repository=$ECR_REGISTRY/$ECR_REPOSITORY \
             --set image.tag=$IMAGE_TAG \
             --namespace default \
