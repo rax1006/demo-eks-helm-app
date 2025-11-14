@@ -12,7 +12,7 @@ on:
 env:
   AWS_REGION: us-east-1
   ECR_REPOSITORY: backend
-  EKS_CLUSTER_NAME: my-eks-cluster
+  EKS_CLUSTER_NAME: eks-platform-production
 
 jobs:
   build-and-deploy:
